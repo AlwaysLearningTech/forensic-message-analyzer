@@ -177,6 +177,29 @@ class ForensicReporter:
                     run.bold = True
                     para.add_run(block['text'])
 
+    @staticmethod
+    def _render_methodology_to_html(sections, base_level: int = 2) -> str:
+        """Render structured methodology sections into HTML — mirrors _render_methodology_to_docx for the WeasyPrint PDF path so the DOCX and PDF stay in sync."""
+        esc = ForensicReporter._esc
+        tag = f"h{min(base_level, 6)}"
+        parts: list = []
+        for section in sections:
+            parts.append(f"<{tag}>{esc(section['heading'])}</{tag}>")
+            for block in section['blocks']:
+                btype = block['type']
+                if btype == 'paragraph':
+                    parts.append(f"<p>{esc(block['text'])}</p>")
+                elif btype == 'bullets':
+                    parts.append("<ul>")
+                    for item in block['items']:
+                        parts.append(f"<li>{esc(item)}</li>")
+                    parts.append("</ul>")
+                elif btype == 'definition':
+                    parts.append(
+                        f"<p><strong>{esc(block['term'])}.</strong> {esc(block['text'])}</p>"
+                    )
+        return "\n".join(parts)
+
     def generate_comprehensive_report(self,
                                      extracted_data: Dict,
                                      analysis_results: Dict,
@@ -231,22 +254,18 @@ class ForensicReporter:
                 f"Methodology document generation failed: {str(e)}"
             )
 
-        # PDF versions: convert each DOCX to PDF via docx2pdf for exact fidelity
-        if 'methodology' in reports:
-            try:
-                methodology_pdf = self._docx_to_pdf(reports['methodology'])
-                if methodology_pdf is not None:
-                    reports['methodology_pdf'] = methodology_pdf
-                    logger.info(f"Generated Methodology PDF: {methodology_pdf}")
-            except Exception as e:
-                logger.warning(
-                    f"[!] PDF conversion failed: {e}\n"
-                    "    If the error mentions libgobject/pango, run:  brew install pango glib"
-                )
-                self.forensic.record_action(
-                    "report_generation_error",
-                    f"Methodology PDF conversion failed: {str(e)}"
-                )
+        # Methodology PDF: rendered directly via WeasyPrint (no Word dependency). The methodology document is structured data so we render it ourselves rather than going DOCX → PDF through MS Word, which has been throwing AppleScript "Message not understood" errors on this examiner's macOS Word build.
+        try:
+            methodology_pdf = self._generate_methodology_pdf(extracted_data, timestamp)
+            if methodology_pdf is not None:
+                reports['methodology_pdf'] = methodology_pdf
+                logger.info(f"Generated Methodology PDF: {methodology_pdf}")
+        except Exception as e:
+            logger.warning(f"[!] Methodology PDF generation failed: {e}")
+            self.forensic.record_action(
+                "report_generation_error",
+                f"Methodology PDF generation failed: {str(e)}"
+            )
 
         if 'word' in reports:
             try:
@@ -355,6 +374,95 @@ class ForensicReporter:
             "methodology_document_generated",
             f"Generated standalone methodology document with hash {file_hash}",
             {"path": str(output_path), "hash": file_hash}
+        )
+        return output_path
+
+    def _generate_methodology_pdf(self, extracted_data: Dict, timestamp: str) -> Optional[Path]:
+        """Render the standalone Methodology Statement to PDF directly via WeasyPrint.
+
+        Mirrors the section structure of `_generate_methodology_document` (title, case header, methodology body, standards compliance, completeness validation) so the DOCX and PDF carry identical content. Bypasses MS Word entirely, which has been failing on the methodology DOCX with AppleScript "Message not understood" errors.
+        """
+        try:
+            from weasyprint import HTML as WeasyprintHTML
+        except ImportError:
+            logger.warning(
+                "[!] WeasyPrint not installed — methodology PDF skipped.\n"
+                "    Install:  pip install weasyprint\n"
+                "    (DOCX is still produced.)"
+            )
+            return None
+
+        esc = self._esc
+        header = self.compliance.generate_report_header()
+        case_numbers = header.get('case_numbers') or [header['case_number']]
+
+        case_block_lines: list = []
+        if len(case_numbers) > 1:
+            case_block_lines.append("<p>Case Numbers:</p><ul>")
+            for cn in case_numbers:
+                case_block_lines.append(f"<li>{esc(cn)}</li>")
+            case_block_lines.append("</ul>")
+        else:
+            case_block_lines.append(f"<p>Case Number: {esc(case_numbers[0])}</p>")
+        if header['case_name'] != 'Not assigned':
+            case_block_lines.append(f"<p>Case Name: {esc(header['case_name'])}</p>")
+        case_block_lines.append(f"<p>Generated: {esc(header['date_of_examination'])}</p>")
+        case_block = "\n".join(case_block_lines)
+
+        sections = self.compliance.generate_methodology_sections()
+        body_html = self._render_methodology_to_html(sections, base_level=2)
+
+        standards_sections = self.compliance.generate_standards_compliance_sections()
+        standards_html = self._render_methodology_to_html(standards_sections, base_level=2)
+
+        messages = extracted_data.get('messages', extracted_data.get('combined', []))
+        completeness = self.compliance.validate_completeness(messages)
+        comp_lines = [
+            f"<p>Total messages examined: {completeness.get('total_messages', 0)}. "
+            f"Conversations analysed: {len(completeness.get('conversations', {}))}. "
+            f"Complete: {'Yes' if completeness.get('is_complete') else 'No'}.</p>"
+        ]
+        issues = completeness.get('issues', [])
+        if issues:
+            comp_lines.append("<p>Issues detected (review and supplement as needed):</p><ul>")
+            for issue in issues:
+                comp_lines.append(f"<li>{esc(issue)}</li>")
+            comp_lines.append("</ul>")
+        else:
+            comp_lines.append("<p>No completeness issues detected.</p>")
+        completeness_html = "\n".join(comp_lines)
+
+        html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Methodology Statement</title>
+<style>
+  @page {{ size: Letter; margin: 1in; }}
+  body {{ font-family: Helvetica, Arial, sans-serif; font-size: 11pt; line-height: 1.4; color: #000; }}
+  h1 {{ font-size: 22pt; text-align: center; margin: 0 0 .5in 0; }}
+  h2 {{ font-size: 14pt; margin-top: 18pt; }}
+  h3 {{ font-size: 12pt; margin-top: 14pt; }}
+  ul {{ margin: 6pt 0 6pt 24pt; }}
+  li {{ margin-bottom: 4pt; }}
+  .page-break {{ page-break-before: always; }}
+</style></head><body>
+<h1>Methodology Statement</h1>
+{case_block}
+{body_html}
+<div class="page-break"></div>
+<h1>Standards Compliance</h1>
+{standards_html}
+<div class="page-break"></div>
+<h2>Completeness Validation (FRE 106)</h2>
+{completeness_html}
+</body></html>"""
+
+        output_path = self.output_dir / f"methodology_{timestamp}.pdf"
+        WeasyprintHTML(string=html).write_pdf(str(output_path))
+
+        file_hash = self.forensic.compute_hash(output_path)
+        self.forensic.record_action(
+            "methodology_pdf_generated",
+            f"Generated standalone methodology PDF with hash {file_hash}",
+            {"path": str(output_path), "hash": file_hash, "renderer": "weasyprint"},
         )
         return output_path
 
