@@ -841,11 +841,13 @@ class ForensicAnalyzer:
             logger.info("[refresh] Leaving pipeline_state.json intact (run may still need --finalize)")
 
     def run_refresh_attachments(self):
-        """Re-run extraction + reporting against an already-reviewed run, preserving AI batch and review decisions.
+        """Re-run extraction only against an already-reviewed run, preserving AI batch and review decisions.
 
-        Use case: the user has downloaded previously-evicted iCloud attachments (or enabled DOWNLOAD_ICLOUD_ATTACHMENTS) and wants updated reports with the images embedded, without re-running the expensive Phase 3 AI batch or re-doing manual review tagging.
+        Use case: the user has downloaded previously-evicted iCloud attachments (or enabled DOWNLOAD_ICLOUD_ATTACHMENTS) and wants the attachment files catalogued so --finalize can embed them in fresh reports.
 
         Safety: re-running Phase 1 produces a bit-identical message set (SQLite ROWIDs are stable; the message-skip condition is unchanged; only previously-blank attachment fields are now populated), so ``threat_{idx}`` review IDs remain valid.
+
+        Reports are NOT regenerated here. Run --finalize after this to produce updated reports.
         """
         logger.info("\n" + "="*80)
         logger.info(" FORENSIC MESSAGE ANALYZER — REFRESH ATTACHMENTS ")
@@ -862,7 +864,6 @@ class ForensicAnalyzer:
         if not state.get("review_complete"):
             logger.warning(
                 "[!] review_complete is not set — review may still be in progress. "
-                "Reports will reflect decisions made so far. "
                 "When review is finished, run:  python3 run.py --mark-review-complete"
             )
 
@@ -904,14 +905,8 @@ class ForensicAnalyzer:
             # Update pipeline_state.json so the new extracted_data_path is recorded
             self._save_pipeline_state()
 
-            # Phases 5-8 against fresh extraction + existing analysis + existing review.
-            # Skip AI executive summary (no re-spend) and keep pipeline_state intact
-            # (the run may still need --finalize or --mark-review-complete + --finalize).
-            self._run_post_review_phases(
-                extracted_data, analysis_results, review_results,
-                skip_ai_summary=True,
-                clear_state_on_success=False,
-            )
+            logger.info("\n[✓] Attachment refresh complete.")
+            logger.info("    Run --finalize to regenerate reports with the refreshed attachments.")
 
         except Exception as e:
             logger.info(f"\n[ERROR] Refresh failed: {e}")

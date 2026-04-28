@@ -175,9 +175,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--refresh-attachments", dest="refresh_attachments",
         nargs="?", const="auto", default=None, metavar="RUN_DIR",
-        help="Re-extract and re-report against an already-reviewed run "
+        help="Re-extract attachments against an already-reviewed run "
              "(preserves AI batch + review decisions). Run after downloading "
-             "iCloud-evicted attachments. Optionally specify run directory path."
+             "iCloud-evicted attachments, then use --finalize to regenerate reports. "
+             "Optionally specify run directory path."
     )
     parser.add_argument(
         "--mark-review-complete", dest="mark_review_complete",
