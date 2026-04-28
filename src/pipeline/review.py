@@ -143,8 +143,34 @@ def _build_review_items(analyzer, analysis_results: Dict, extracted_data: Dict) 
     """Assemble the flat list of items presented to the reviewer.
 
     Every finding is stamped with a source in {pattern_matched, ai_screened, extracted} and a method label so downstream reports can distinguish deterministic pattern matches from AI flags and raw extracted content.
+
+    Items carry a ``timestamp`` field so the queue is sorted chronologically across sources (iMessage + WhatsApp + email + ...). Without this sort, items come out in extraction order and the reviewer jumps across years between adjacent items.
     """
+    import pandas as pd
+
     items_for_review: list = []
+
+    # Lookup tables for resolving an item's timestamp from its source message. AI items only carry the ``quote`` text, so we need a content → message map. Pattern threats and emails carry message_id.
+    msgs = extracted_data.get("messages", [])
+    msg_by_id: dict = {}
+    msg_by_content: dict = {}
+    for m in msgs:
+        mid = m.get("message_id")
+        if mid is not None and str(mid) not in msg_by_id:
+            msg_by_id[str(mid)] = m
+        c = m.get("content")
+        if c and c not in msg_by_content:
+            msg_by_content[c] = m
+
+    def _resolve_ts(*, message_id: str = "", content: str = "", direct: object = None):
+        """Return the best available timestamp string for an item."""
+        if direct not in (None, ""):
+            return direct
+        if message_id and str(message_id) in msg_by_id:
+            return msg_by_id[str(message_id)].get("timestamp", "")
+        if content and content in msg_by_content:
+            return msg_by_content[content].get("timestamp", "")
+        return ""
 
     # Pattern-matched threats (deterministic YAML/regex).
     if "threats" in analysis_results:
@@ -161,6 +187,11 @@ def _build_review_items(analyzer, analysis_results: Dict, extracted_data: Dict) 
                         "categories": item.get("threat_categories", ""),
                         "confidence": item.get("threat_confidence", 0),
                         "message_id": item.get("message_id", ""),
+                        "timestamp": _resolve_ts(
+                            direct=item.get("timestamp"),
+                            message_id=item.get("message_id", ""),
+                            content=item.get("content", ""),
+                        ),
                     })
 
     # AI-screened threats and coercive control patterns.
@@ -171,36 +202,40 @@ def _build_review_items(analyzer, analysis_results: Dict, extracted_data: Dict) 
     if ai_threats.get("found"):
         for i, detail in enumerate(ai_threats.get("details", [])):
             if isinstance(detail, dict):
+                quote = detail.get("quote", "")
                 items_for_review.append({
                     "id": f"ai_threat_{i}",
                     "type": "ai_threat",
                     "source": "ai_screened",
                     "method": ai_model_name,
-                    "content": detail.get("quote", ""),
+                    "content": quote,
                     "categories": f"{detail.get('type', '')} — {detail.get('target', '')}",
                     "confidence": detail.get("severity", ""),
                     "message_id": "",
                     "rcw_relevance": detail.get("rcw_relevance", ""),
+                    "timestamp": _resolve_ts(content=quote),
                 })
 
     ai_cc = ai_analysis.get("coercive_control", {})
     if ai_cc.get("detected"):
         for i, pattern in enumerate(ai_cc.get("patterns", [])):
             if isinstance(pattern, dict):
+                quote = pattern.get("quote", "")
                 items_for_review.append({
                     "id": f"ai_coercive_{i}",
                     "type": "ai_coercive_control",
                     "source": "ai_screened",
                     "method": ai_model_name,
-                    "content": pattern.get("quote", ""),
+                    "content": quote,
                     "categories": f"Coercive control: {pattern.get('type', '')}",
                     "confidence": pattern.get("severity", ""),
                     "message_id": "",
+                    "timestamp": _resolve_ts(content=quote),
                 })
 
     # All email messages are routed to review — emails are low-volume and each is purposeful. Third-party emails (counselors, attorneys, family) provide corroboration; mapped-person emails may need reviewer annotations.
     mapped_persons = set(analyzer.config.contact_mappings.keys())
-    for msg in extracted_data.get("messages", []):
+    for msg in msgs:
         if msg.get("source") != "email":
             continue
         sender = msg.get("sender", "")
@@ -218,6 +253,21 @@ def _build_review_items(analyzer, analysis_results: Dict, extracted_data: Dict) 
             "confidence": 0.0,
             "message_id": msg.get("message_id", ""),
             "subject": subject,
+            "timestamp": msg.get("timestamp", ""),
         })
+
+    # Chronological sort across sources. Timestamps arrive as pd.Timestamp/datetime on the initial run and as ISO strings after JSON round-trip on finalize/refresh, so normalize via pd.to_datetime. Undated items pile up at the end (Timestamp.max).
+    sentinel = pd.Timestamp.max.tz_localize("UTC")
+
+    def _ts_key(it):
+        raw = it.get("timestamp", "")
+        if raw in (None, "", "NaT"):
+            return sentinel
+        parsed = pd.to_datetime(raw, utc=True, errors="coerce")
+        if pd.isna(parsed):
+            return sentinel
+        return parsed
+
+    items_for_review.sort(key=_ts_key)
 
     return items_for_review
