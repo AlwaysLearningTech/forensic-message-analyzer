@@ -18,10 +18,12 @@ import logging
 from dataclasses import dataclass
 
 try:
-    from anthropic import Anthropic
+    from anthropic import Anthropic, APIConnectionError, APITimeoutError
     AI_AVAILABLE = True
 except ImportError:
     AI_AVAILABLE = False
+    APIConnectionError = type("APIConnectionError", (Exception,), {})
+    APITimeoutError = type("APITimeoutError", (Exception,), {})
 
 from ..config import Config
 from ..forensic_utils import ForensicRecorder
@@ -128,6 +130,10 @@ class AIAnalyzer:
         self.max_tokens_per_minute = getattr(_config, 'tokens_per_minute', 25000)
         self.max_requests_per_minute = getattr(_config, 'max_requests_per_minute', 40)
         self.use_batch_api = getattr(_config, 'use_batch_api', True)
+
+        # Set to True the moment a batch is created on Anthropic's side. The outer analyze_messages() reads this to decide whether falling back to the synchronous path would double-bill — once a batch is in flight, never re-submit; raise so the caller can resume via --resume-batch.
+        self._batch_submitted = False
+        self._last_batch_id: Optional[str] = None
 
         # Initialize Anthropic client if credentials available
         self.client = None
@@ -365,11 +371,12 @@ class AIAnalyzer:
     # ------------------------------------------------------------------
 
     def analyze_messages(self, messages: List[Dict], batch_size: int = 50,
-                         generate_summary: bool = True) -> Dict[str, Any]:
+                         generate_summary: bool = True,
+                         state_writer=None) -> Dict[str, Any]:
         """
         Analyze messages using Claude for advanced insights.
 
-        Uses the Batch API by default (50% cost discount + prompt caching). Falls back to synchronous processing if batch API is disabled or fails.
+        Uses the Batch API by default (50% cost discount + prompt caching). Falls back to synchronous processing if batch API is disabled or fails BEFORE submission. Once a batch has been created on Anthropic's side, this method will re-raise rather than fall back — re-submitting would double-bill. Use ``ForensicAnalyzer.resume_ai_batch()`` (`run.py --resume-batch`) to recover an in-flight batch.
 
         Args:
             messages: List of message dictionaries
@@ -378,6 +385,13 @@ class AIAnalyzer:
             generate_summary: If True, generate executive summary after batch
                               processing. Set False for pre-review batch runs
                               where summary will be generated later.
+            state_writer: Optional callable invoked after batch submission with
+                          a dict of {batch_id, submitted_at, total_requests,
+                          status}. Used by the pipeline to persist the batch id
+                          to ``pipeline_state.json`` so a sleep/disconnect can
+                          be recovered via --resume-batch. Called again with
+                          ``status="ended"`` after results are merged so the
+                          caller can clear the in-flight marker.
 
         Returns:
             Dictionary containing AI analysis results
@@ -389,20 +403,30 @@ class AIAnalyzer:
             )
             return self._empty_analysis()
 
+        # Reset before each invocation; batch path sets True after batches.create.
+        self._batch_submitted = False
+        self._last_batch_id = None
+
         if self.use_batch_api:
             try:
                 return self._analyze_messages_batch(messages, batch_size,
-                                                    generate_summary=generate_summary)
+                                                    generate_summary=generate_summary,
+                                                    state_writer=state_writer)
             except Exception as e:
-                # If the batch was already submitted to Anthropic, do NOT fall back to sync (that would re-process everything at 2x cost). Only fall back for pre-submission errors.
-                if "Batch" in str(e) and ("timed out" in str(e).lower() or "batch_" in str(e).lower()):
-                    logger.error(f"Batch API failed after submission: {e}")
+                if self._batch_submitted:
+                    # Batch is already running (or completed) on Anthropic's side. NEVER fall back to sync — that re-submits the same work at full price. The batch_id is in pipeline_state.json; user recovers via `python3 run.py --resume-batch`.
+                    logger.error(
+                        f"Batch API failed AFTER submission (batch_id={self._last_batch_id}): {e}"
+                    )
+                    logger.error(
+                        f"Batch is still running on Anthropic — recover with: python3 run.py --resume-batch"
+                    )
                     self.forensic.record_action(
                         "batch_api_post_submit_failure",
-                        f"Batch failed after submission — NOT falling back to sync to avoid double billing: {str(e)}",
-                        {"error": str(e)},
+                        f"Batch {self._last_batch_id} failed after submission — NOT falling back to sync to avoid double billing: {str(e)}",
+                        {"error": str(e), "batch_id": self._last_batch_id},
                     )
-                    raise  # Let caller handle; do NOT re-run via sync
+                    raise
                 logger.warning(f"Batch API failed (pre-submission), falling back to synchronous: {e}")
                 self.forensic.record_action(
                     "batch_api_fallback",
@@ -418,7 +442,8 @@ class AIAnalyzer:
     # ------------------------------------------------------------------
 
     def _analyze_messages_batch(self, messages: List[Dict], batch_size: int,
-                                generate_summary: bool = True) -> Dict[str, Any]:
+                                generate_summary: bool = True,
+                                state_writer=None) -> Dict[str, Any]:
         """
         Submit all analysis requests via the Anthropic Message Batches API.
 
@@ -500,6 +525,8 @@ class AIAnalyzer:
         # Submit the batch
         message_batch = self.client.messages.batches.create(requests=batch_requests)
         batch_id = message_batch.id
+        self._batch_submitted = True
+        self._last_batch_id = batch_id
 
         self.forensic.record_action(
             "batch_api_created",
@@ -507,13 +534,78 @@ class AIAnalyzer:
             {"batch_id": batch_id},
         )
 
-        # Poll for completion (max 4 hours to avoid blocking forever)
-        print(f"    Batch {batch_id} created. Waiting for completion...")
-        poll_interval = 10  # seconds
-        max_wait = 4 * 60 * 60  # 4 hours
+        # Persist the batch_id to pipeline_state.json IMMEDIATELY so a sleep/disconnect during polling can be recovered. Do this before any polling — the loop is the failure-prone part.
+        if state_writer is not None:
+            try:
+                state_writer({
+                    "batch_id": batch_id,
+                    "submitted_at": datetime.now().isoformat(),
+                    "total_requests": total_requests,
+                    "status": "in_progress",
+                })
+            except Exception as e:
+                logger.warning(f"Failed to persist batch_id to pipeline state: {e}")
+
+        # Poll until ended; resilient to transient network errors.
+        self._poll_until_ended(batch_id, total_requests)
+
+        analysis_results = self._collect_batch_results(
+            batch_id=batch_id,
+            analysis_results=analysis_results,
+            total_requests=total_requests,
+            generate_summary=generate_summary,
+            log_message_count=len(messages),
+        )
+
+        # Mark the in-flight batch as completed in pipeline_state.json. The caller (ai_batch.py) clears the block on the next save.
+        if state_writer is not None:
+            try:
+                state_writer({
+                    "batch_id": batch_id,
+                    "submitted_at": datetime.now().isoformat(),
+                    "total_requests": total_requests,
+                    "status": "ended",
+                })
+            except Exception as e:
+                logger.warning(f"Failed to mark batch ended in pipeline state: {e}")
+
+        return analysis_results
+
+    # ------------------------------------------------------------------
+    # Batch helpers — also used by resume_batch
+    # ------------------------------------------------------------------
+
+    def _poll_until_ended(self, batch_id: str, total_requests: int):
+        """Poll Anthropic until the batch reaches ``processing_status='ended'``.
+
+        Resilient to transient network errors (sleep, brief disconnect). Catches
+        ``APIConnectionError``/``APITimeoutError``/``OSError`` from the SDK and
+        backs off up to 60s between retries; resets the interval on success.
+        Honors the existing 4-hour ``max_wait`` ceiling. The 4-hour clock counts
+        only successful retrievals — time spent offline does not advance it,
+        so a long sleep simply pauses progress rather than tripping the timeout.
+        """
+        print(f"    Polling batch {batch_id}...")
+        poll_interval = 10
+        max_poll_interval = 60
+        max_wait = 4 * 60 * 60
         elapsed = 0
         while True:
-            message_batch = self.client.messages.batches.retrieve(batch_id)
+            try:
+                message_batch = self.client.messages.batches.retrieve(batch_id)
+            except (APIConnectionError, APITimeoutError, OSError) as e:
+                logger.warning(
+                    f"Batch poll network error ({type(e).__name__}: {e}); retrying in {poll_interval}s"
+                )
+                self.forensic.record_action(
+                    "batch_api_polling_retry",
+                    f"Polling network error for {batch_id}: {type(e).__name__}",
+                    {"batch_id": batch_id, "error": str(e), "next_retry_seconds": poll_interval},
+                )
+                time.sleep(poll_interval)
+                poll_interval = min(max_poll_interval, int(poll_interval * 1.5))
+                continue
+
             counts = message_batch.request_counts
             completed = counts.succeeded + counts.errored + counts.canceled + counts.expired
             print(
@@ -523,27 +615,42 @@ class AIAnalyzer:
             )
 
             if message_batch.processing_status == "ended":
-                print()  # newline after progress
-                break
+                print()
+                return message_batch
 
             if elapsed >= max_wait:
-                print(f"\n    Batch timed out after {max_wait // 3600} hours. "
-                      f"Batch ID: {batch_id} — check console.anthropic.com for status.")
+                print(
+                    f"\n    Batch timed out after {max_wait // 3600} hours. "
+                    f"Batch ID: {batch_id} — recover later with `python3 run.py --resume-batch`."
+                )
                 raise TimeoutError(
                     f"Batch {batch_id} did not complete within {max_wait // 3600} hours"
                 )
 
+            # Successful retrieve — reset to fast polling.
+            poll_interval = 10
             time.sleep(poll_interval)
             elapsed += poll_interval
 
+    def _collect_batch_results(self, batch_id: str, analysis_results: Dict[str, Any],
+                               total_requests: int, generate_summary: bool,
+                               log_message_count: int) -> Dict[str, Any]:
+        """Iterate the results of an ended batch, merge them into analysis_results, and run post-processing (cost accounting, sentiment overall, dedup, summary).
+
+        Shared by the initial run and ``resume_batch``.
+        """
         # Process results
         total_input_tokens = 0
         total_output_tokens = 0
         cache_read_tokens = 0
         cache_creation_tokens = 0
+        succeeded_count = 0
+        errored_count = 0
+        other_count = 0
 
         for result in self.client.messages.batches.results(batch_id):
             if result.result.type == "succeeded":
+                succeeded_count += 1
                 msg = result.result.message
                 # Always count tokens, even if JSON parsing fails
                 total_input_tokens += msg.usage.input_tokens
@@ -561,12 +668,14 @@ class AIAnalyzer:
                         f"Parse error for {result.custom_id}: {str(e)}"
                     )
             elif result.result.type == "errored":
+                errored_count += 1
                 error_msg = str(getattr(result.result, 'error', 'Unknown error'))
                 analysis_results["processing_stats"]["errors"].append(
                     f"API error for {result.custom_id}: {error_msg}"
                 )
             else:
                 # Handle expired, canceled, or other non-success results
+                other_count += 1
                 analysis_results["processing_stats"]["errors"].append(
                     f"Request {result.custom_id} {result.result.type} (not processed)"
                 )
@@ -597,7 +706,7 @@ class AIAnalyzer:
             cache_info = f" (cache: {cache_read_tokens:,} read, {cache_creation_tokens:,} written)"
 
         print(
-            f"    Batch complete: {counts.succeeded} succeeded, "
+            f"    Batch complete: {succeeded_count} succeeded, "
             f"{total_input_tokens:,} input + {total_output_tokens:,} output tokens"
             + cache_info
             + f"\n    Batch cost: ${estimated_cost:.2f}"
@@ -645,12 +754,12 @@ class AIAnalyzer:
 
         self.forensic.record_action(
             "batch_analysis_complete",
-            f"Completed batch analysis of {len(messages)} messages",
+            f"Completed batch analysis of {log_message_count} messages",
             {
                 "batch_id": batch_id,
                 "total_requests": total_requests,
-                "succeeded": counts.succeeded,
-                "errored": counts.errored,
+                "succeeded": succeeded_count,
+                "errored": errored_count,
                 "input_tokens": total_input_tokens,
                 "output_tokens": total_output_tokens,
                 "cache_read_tokens": cache_read_tokens,
@@ -658,6 +767,85 @@ class AIAnalyzer:
                 "errors": len(analysis_results["processing_stats"]["errors"]),
                 "risk_indicators_found": len(analysis_results["risk_indicators"]),
             },
+        )
+
+        return analysis_results
+
+    # ------------------------------------------------------------------
+    # Resume path — used when a previous run's polling was interrupted by
+    # a sleep / disconnect / kill, but Anthropic kept processing the batch
+    # server-side. Triggered via `python3 run.py --resume-batch`.
+    # ------------------------------------------------------------------
+
+    def resume_batch(self, batch_id: str, log_message_count: int,
+                     generate_summary: bool = False,
+                     state_writer=None) -> Dict[str, Any]:
+        """Resume an in-flight batch by ID, poll until ended, and collect results.
+
+        Args:
+            batch_id: The Anthropic batch ID (e.g. ``msgbatch_01...``) returned
+                from ``client.messages.batches.create`` in the original run.
+            log_message_count: How many messages were originally submitted.
+                Used only for ``analysis_results.total_messages_analyzed`` and
+                forensic logging — does not affect result merging, which is
+                keyed by the batch's own ``custom_id`` values.
+            generate_summary: Match the original run's flag. The default
+                (``False``) matches Phase 3 pre-review screening, where the
+                executive summary runs later in finalize.
+            state_writer: Optional callable; same shape as in
+                ``analyze_messages``. Called with status="ended" after results
+                are collected so the caller can clear ``ai_batch`` from
+                ``pipeline_state.json``.
+        """
+        if not self.client:
+            raise RuntimeError("AI analyzer client is not configured; cannot resume batch.")
+
+        # Ask Anthropic for current status. retrieve() raises a 404 if the batch_id is wrong or expired (~29-day retention).
+        batch_obj = self.client.messages.batches.retrieve(batch_id)
+        total_requests = batch_obj.request_counts.processing + (
+            batch_obj.request_counts.succeeded
+            + batch_obj.request_counts.errored
+            + batch_obj.request_counts.canceled
+            + batch_obj.request_counts.expired
+        )
+
+        self.forensic.record_action(
+            "batch_api_resumed",
+            f"Resuming batch {batch_id} (status={batch_obj.processing_status})",
+            {"batch_id": batch_id, "status": batch_obj.processing_status,
+             "total_requests": total_requests},
+        )
+
+        if batch_obj.processing_status != "ended":
+            print(f"    Batch {batch_id} still processing — resuming polling.")
+            self._poll_until_ended(batch_id, total_requests)
+        else:
+            print(f"    Batch {batch_id} already ended — fetching results.")
+
+        analysis_results = self._init_analysis_results(log_message_count)
+        analysis_results = self._collect_batch_results(
+            batch_id=batch_id,
+            analysis_results=analysis_results,
+            total_requests=total_requests,
+            generate_summary=generate_summary,
+            log_message_count=log_message_count,
+        )
+
+        if state_writer is not None:
+            try:
+                state_writer({
+                    "batch_id": batch_id,
+                    "submitted_at": datetime.now().isoformat(),
+                    "total_requests": total_requests,
+                    "status": "ended",
+                })
+            except Exception as e:
+                logger.warning(f"Failed to mark batch ended in pipeline state: {e}")
+
+        self.forensic.record_action(
+            "batch_api_resume_completed",
+            f"Resume completed for batch {batch_id}",
+            {"batch_id": batch_id, "total_requests": total_requests},
         )
 
         return analysis_results

@@ -22,7 +22,7 @@ from typing import Optional
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent))
 
-from src.main import main, finalize, refresh_attachments, mark_review_complete, recover_state
+from src.main import main, finalize, refresh_attachments, mark_review_complete, recover_state, resume_batch_cli
 from src.config import Config
 
 
@@ -43,6 +43,24 @@ def _find_latest_run_dir(base_dir: Path) -> Optional[Path]:
         # New layout: analysis/pipeline_state.json; legacy: pipeline_state.json at root
         if (d / "analysis" / "pipeline_state.json").exists() or (d / "pipeline_state.json").exists():
             return d
+    return None
+
+
+def _find_run_dir_with_inflight_batch(base_dir: Path) -> Optional[Path]:
+    """Find the most recent run directory whose pipeline_state.json has an in-flight ai_batch block."""
+    run_dirs = sorted(base_dir.glob("run_*"), reverse=True)
+    for d in run_dirs:
+        for candidate in [d / "analysis" / "pipeline_state.json", d / "pipeline_state.json"]:
+            if not candidate.exists():
+                continue
+            try:
+                with open(candidate) as f:
+                    state = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                continue
+            ai_batch = state.get("ai_batch")
+            if ai_batch and ai_batch.get("batch_id"):
+                return d
     return None
 
 
@@ -195,6 +213,14 @@ if __name__ == "__main__":
              "artifacts (extracted_data, analysis_results, etc.) are still on disk. "
              "Requires an explicit run directory path (no auto-detect — this is a manual repair)."
     )
+    parser.add_argument(
+        "--resume-batch", dest="resume_batch",
+        nargs="?", const="auto", default=None, metavar="RUN_DIR",
+        help="Resume an in-flight Anthropic batch after a sleep/disconnect/kill "
+             "interrupted polling. Reads the batch_id from pipeline_state.json's "
+             "ai_batch block, polls until ended, and writes the results — without "
+             "re-submitting (so no double billing). Optionally specify run directory."
+    )
     args = parser.parse_args()
 
     # Build config using the resolved .env location, then configure logging from it.
@@ -242,6 +268,28 @@ if __name__ == "__main__":
             run_dir = _resolve_run_dir(args.mark_review_complete, config)
             config.output_dir = str(run_dir)
             success = mark_review_complete(config)
+            sys.exit(0 if success else 1)
+
+        elif args.resume_batch is not None:
+            # --resume-batch mode: recover an in-flight Anthropic batch by ID
+            if args.resume_batch == "auto":
+                detected = _find_run_dir_with_inflight_batch(Path(config.output_dir))
+                if not detected:
+                    logging.error(
+                        "No run directory with an in-flight ai_batch block found in %s. "
+                        "Pass an explicit RUN_DIR or check pipeline_state.json.",
+                        config.output_dir,
+                    )
+                    sys.exit(2)
+                run_dir = detected
+                logging.info(f"Auto-detected in-flight batch run: {run_dir.name}")
+            else:
+                run_dir = Path(args.resume_batch)
+                if not run_dir.is_dir():
+                    logging.error(f"Run directory does not exist: {run_dir}")
+                    sys.exit(2)
+            config.output_dir = str(run_dir)
+            success = resume_batch_cli(config)
             sys.exit(0 if success else 1)
 
         elif args.resume is not None:

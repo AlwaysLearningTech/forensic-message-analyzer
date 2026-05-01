@@ -325,7 +325,8 @@ class ForensicAnalyzer:
     def _save_pipeline_state(self, review_session_id=_UNSET,
                              review_results_path=_UNSET,
                              ai_batch_results_path=_UNSET,
-                             review_complete=_UNSET):
+                             review_complete=_UNSET,
+                             ai_batch=_UNSET):
         """Save pipeline state so a crashed run can resume or finalize later.
 
         Fields not explicitly passed are preserved from any existing state file — this lets mid-phase saves (e.g. marking the review session_id when Phase 4 starts) update one field without clobbering paths set by earlier phases. Pass the value explicitly (including None) to overwrite.
@@ -339,6 +340,7 @@ class ForensicAnalyzer:
             "review_results_path": existing.get("review_results_path") if review_results_path is self._UNSET else review_results_path,
             "review_session_id": existing.get("review_session_id") if review_session_id is self._UNSET else review_session_id,
             "review_complete": existing.get("review_complete", False) if review_complete is self._UNSET else review_complete,
+            "ai_batch": existing.get("ai_batch") if ai_batch is self._UNSET else ai_batch,
         }
         state_path = self.config.analysis_dir() / "pipeline_state.json"
         with open(state_path, 'w') as f:
@@ -1018,6 +1020,100 @@ class ForensicAnalyzer:
             logger.info(f"    No review_results found — resume review with:")
             logger.info(f"      python3 run.py --resume \"{out_dir}\"")
 
+    def resume_ai_batch(self):
+        """Resume an in-flight Anthropic batch after disconnect/sleep.
+
+        Reads ``pipeline_state.json``'s ``ai_batch`` block, polls Anthropic for the
+        batch ID stored there, collects the results, merges them into
+        ``analysis_results``, and clears the in-flight marker. Safe to re-run; if
+        the batch has already ended, the polling step is a no-op and the results
+        iteration runs immediately.
+        """
+        state = self._load_pipeline_state()
+        if not state:
+            raise RuntimeError(
+                "No pipeline_state.json found in this run directory — nothing to resume."
+            )
+        ai_batch = state.get("ai_batch")
+        if not ai_batch:
+            raise RuntimeError(
+                "pipeline_state.json has no ai_batch block — nothing to resume. "
+                "If you believe a batch is in flight, check forensic_log_*.jsonl "
+                "for batch_api_created and reconstruct the state file manually."
+            )
+
+        batch_id = ai_batch.get("batch_id")
+        messages_path = ai_batch.get("messages_path")
+        if not batch_id:
+            raise RuntimeError("ai_batch block is missing batch_id; cannot resume.")
+        if not messages_path or not Path(messages_path).exists():
+            raise RuntimeError(
+                f"ai_batch.messages_path is missing or unreadable: {messages_path}. "
+                "The cached message list is required to size analysis_results correctly."
+            )
+
+        with open(messages_path) as f:
+            mapped_messages = json.load(f)
+        message_count = len(mapped_messages)
+
+        logger.info(f"\n[*] Resuming batch {batch_id} ({message_count} messages)")
+
+        from .analyzers.ai_analyzer import AIAnalyzer
+        ai_analyzer = AIAnalyzer(forensic_recorder=self.forensic, config=self.config)
+        if not ai_analyzer.client:
+            raise RuntimeError(
+                "AI analyzer is not configured (no API key). Cannot resume batch."
+            )
+
+        def _state_writer(batch_info: dict):
+            block = dict(batch_info)
+            block["messages_path"] = str(messages_path)
+            self._save_pipeline_state(ai_batch=block)
+
+        ai_results = ai_analyzer.resume_batch(
+            batch_id,
+            log_message_count=message_count,
+            generate_summary=False,
+            state_writer=_state_writer,
+        )
+
+        threat_count = len(ai_results.get("threat_assessment", {}).get("details", []))
+        cc_count = len(ai_results.get("coercive_control", {}).get("patterns", []))
+        logger.info(f"    Resume complete - {threat_count} threats, {cc_count} coercive control patterns found")
+
+        # Persist the AI batch results file (same shape Phase 3 would write).
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ai_output_file = self.config.analysis_dir() / f"ai_batch_results_{timestamp}.json"
+        with open(ai_output_file, "w") as f:
+            json.dump(ai_results, f, indent=2, default=str)
+        self._ai_batch_results_path = ai_output_file
+        logger.info(f"    AI batch results saved to {ai_output_file.name}")
+
+        # Merge into analysis_results on disk so finalize can load the complete picture.
+        analysis_path = state.get("analysis_results_path")
+        if analysis_path and Path(analysis_path).exists():
+            with open(analysis_path) as f:
+                analysis_results = json.load(f)
+            analysis_results["ai_analysis"] = ai_results
+            with open(analysis_path, "w") as f:
+                json.dump(analysis_results, f, indent=2, default=str)
+            logger.info(f"    Merged AI results into {Path(analysis_path).name}")
+
+        # Clear the in-flight marker and stamp the new ai_batch_results_path.
+        self._save_pipeline_state(
+            ai_batch=None,
+            ai_batch_results_path=str(ai_output_file),
+        )
+        try:
+            Path(messages_path).unlink()
+        except (FileNotFoundError, OSError):
+            pass
+
+        out_dir = Path(self.config.output_dir)
+        logger.info(f"\n[✓] Batch {batch_id} resumed successfully.")
+        logger.info(f"    Continue with manual review:")
+        logger.info(f"      python3 run.py --resume \"{out_dir}\"")
+
 
 def main(config: Config = None, resume: bool = False):
     """Main entry point for the forensic analyzer (Phases 1-4).
@@ -1089,6 +1185,29 @@ def recover_state(config: Config = None):
         return True
     except Exception as e:
         logger.info(f"\n[ERROR] Recover-state failed: {e}")
+        return False
+
+
+def resume_batch_cli(config: Config = None):
+    """Entry point to resume an in-flight Anthropic batch after disconnect/sleep.
+
+    Reads ``pipeline_state.json`` for the ``ai_batch`` block written by Phase 3,
+    polls Anthropic for the batch by ID, collects the results, and writes
+    ``ai_batch_results_*.json`` plus the merged analysis. Use after the local
+    process was killed (sleep, Wi-Fi loss, Ctrl+C) while a batch was still
+    polling — the batch keeps running on Anthropic's side regardless.
+
+    Args:
+        config: Configuration instance. ``config.output_dir`` must point to the
+            run directory of the original (interrupted) run.
+    """
+    try:
+        analyzer = ForensicAnalyzer(config)
+        analyzer.resume_ai_batch()
+        return True
+    except Exception as e:
+        logger.info(f"\n[ERROR] Resume-batch failed: {e}")
+        logger.exception(e)
         return False
 
 

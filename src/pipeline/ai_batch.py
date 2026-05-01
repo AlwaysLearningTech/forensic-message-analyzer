@@ -46,10 +46,24 @@ def run(analyzer, extracted_data: Dict) -> Dict:
         if skipped:
             logger.info(f"    Filtered to {len(mapped_messages)} mapped-contact messages (skipped {skipped} unmapped)")
 
+        # Serialize the filtered list to disk BEFORE submission so a sleep/disconnect during polling can be recovered. The resume path needs the message count to size analysis_results correctly; storing the full list also lets a future resume regenerate request prompts deterministically if Anthropic ever returns errored entries we want to retry.
+        analysis_dir = analyzer.config.analysis_dir()
+        analysis_dir.mkdir(parents=True, exist_ok=True)
+        inflight_messages_path = analysis_dir / "ai_batch_inflight_messages.json"
+        with open(inflight_messages_path, "w") as f:
+            json.dump(mapped_messages, f, indent=2, default=str)
+
+        def _state_writer(batch_info: dict):
+            """Persist batch lifecycle (submitted/ended) to pipeline_state.json."""
+            block = dict(batch_info)
+            block["messages_path"] = str(inflight_messages_path)
+            analyzer._save_pipeline_state(ai_batch=block)
+
         ai_results = ai_analyzer.analyze_messages(
             mapped_messages,
             batch_size=analyzer.config.batch_size,
             generate_summary=False,
+            state_writer=_state_writer,
         )
         threat_count = len(ai_results.get("threat_assessment", {}).get("details", []))
         cc_count = len(ai_results.get("coercive_control", {}).get("patterns", []))
@@ -71,6 +85,13 @@ def run(analyzer, extracted_data: Dict) -> Dict:
             json.dump(ai_results, f, indent=2, default=str)
         analyzer._ai_batch_results_path = ai_output_file
         logger.info(f"    AI batch results saved to {ai_output_file.name}")
+
+        # Results are persisted; the in-flight marker is no longer needed. Clear it so a future --resume-batch invocation cannot accidentally re-process this run.
+        analyzer._save_pipeline_state(ai_batch=None)
+        try:
+            inflight_messages_path.unlink()
+        except (FileNotFoundError, OSError):
+            pass
 
         return ai_results
     except Exception as e:
