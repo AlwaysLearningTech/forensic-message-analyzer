@@ -157,6 +157,8 @@ class Config:
         # AI processing mode
         self.use_batch_api = os.getenv('USE_BATCH_API', 'true').lower() == 'true'
         self.skip_ai_tagging = os.getenv('SKIP_AI_TAGGING', 'false').lower() == 'true'
+        # DOCX → PDF via docx2pdf drives MS Word over AppleScript; on this examiner's build it has been throwing "Message not understood" and stranding the finalize. Set SKIP_DOCX_PDF=true in .env to skip Word conversion entirely (DOCX files are still produced; methodology PDF still renders via WeasyPrint).
+        self.skip_docx_pdf = os.getenv('SKIP_DOCX_PDF', 'false').lower() == 'true'
 
         # Rate limiting (used in synchronous mode only; batch API handles its own limits)
         self.max_requests_per_minute = int(os.getenv('MAX_REQUESTS_PER_MINUTE', '40'))
@@ -242,6 +244,7 @@ class Config:
                 "summary_model": self.ai_summary_model,
                 "use_batch_api": self.use_batch_api,
                 "skip_ai_tagging": self.skip_ai_tagging,
+                "skip_docx_pdf": self.skip_docx_pdf,
                 "max_requests_per_minute": self.max_requests_per_minute,
                 "tokens_per_minute": self.tokens_per_minute,
                 "request_delay_ms": self.request_delay_ms,

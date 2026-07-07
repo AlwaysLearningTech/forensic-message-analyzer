@@ -80,21 +80,27 @@ class ForensicReporter:
         return match_quote_to_message(quote, messages)
 
     def _docx_to_pdf(self, docx_path: Path) -> Optional[Path]:
-        """Convert a DOCX file to PDF using docx2pdf (MS Word / LibreOffice).
+        """Convert a DOCX file to PDF using docx2pdf (MS Word).
 
         On macOS, MS Word is sandboxed and may lack permission to read/write arbitrary directories. We work around this by copying the DOCX into a temporary directory under ~/Documents (which Word always has access to), converting there, then moving the PDF back to the original location.
 
-        Returns the path to the generated PDF, or None if conversion is unavailable.
+        Returns the path to the generated PDF, or None if conversion is unavailable, disabled via SKIP_DOCX_PDF, or hangs past the timeout.
         """
+        # Opt-out: SKIP_DOCX_PDF=true in .env disables Word conversion entirely. Set on machines where Word AppleScript throws "Message not understood" and hangs the process; DOCX files are still emitted and callers already handle None.
+        if getattr(self, 'config', None) is not None and getattr(self.config, 'skip_docx_pdf', False):
+            logger.info(f"    [skip] DOCX→PDF disabled (SKIP_DOCX_PDF=true) — keeping {docx_path.name}")
+            return None
+
         import shutil
         import tempfile
+        import threading
         try:
             from docx2pdf import convert
         except ModuleNotFoundError:
             logger.warning(
                 "[!] docx2pdf not installed — PDF conversion skipped.\n"
                 "    Install:  pip install docx2pdf\n"
-                "    Also requires Microsoft Word or LibreOffice on this Mac.\n"
+                "    Also requires Microsoft Word on this Mac.\n"
                 "    (DOCX files are still produced.)"
             )
             return None
@@ -112,7 +118,29 @@ class ForensicReporter:
             tmp_docx = tmp_dir / docx_path.name
             tmp_pdf = tmp_dir / pdf_path.name
             shutil.copy2(docx_path, tmp_docx)
-            convert(str(tmp_docx), str(tmp_pdf))
+
+            # Hard timeout on the AppleScript call. Word can hang indefinitely on this examiner's build; a daemon thread lets the interpreter exit even if Word is still churning.
+            timeout_seconds = 180
+            worker_result = {"error": None}
+
+            def _worker():
+                try:
+                    convert(str(tmp_docx), str(tmp_pdf))
+                except Exception as e:
+                    worker_result["error"] = e
+
+            worker = threading.Thread(target=_worker, daemon=True)
+            worker.start()
+            worker.join(timeout=timeout_seconds)
+            if worker.is_alive():
+                logger.warning(
+                    f"[!] docx2pdf timed out after {timeout_seconds}s on {docx_path.name} — skipping PDF. "
+                    f"Set SKIP_DOCX_PDF=true in .env to disable this conversion permanently."
+                )
+                return None
+            if worker_result["error"] is not None:
+                raise worker_result["error"]
+
             if not tmp_pdf.exists():
                 raise RuntimeError(f"MS Word failed to produce {tmp_pdf.name} — Word may need to be restarted or granted Full Disk Access in System Settings > Privacy")
             shutil.move(str(tmp_pdf), str(pdf_path))

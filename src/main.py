@@ -689,6 +689,10 @@ class ForensicAnalyzer:
     def _run_executive_summary(self, extracted_data, analysis_results):
         """Phase 6: generate AI executive summary post-review. Factored out so refresh can skip it."""
         ai_results = analysis_results.get('ai_analysis', {})
+        # Idempotency: if a summary is already on disk (from a prior finalize that crashed in Phase 7), reuse it. Prevents re-paying ~$1.30/run for the executive summary API call.
+        if ai_results.get('conversation_summary'):
+            logger.info("\n[*] Executive summary already generated — skipping Phase 6 (no cost)")
+            return
         batch_was_skipped = getattr(self.config, 'skip_ai_tagging', False)
         if not batch_was_skipped and not (ai_results and ai_results.get('total_messages', 0) > 0):
             logger.info("\n[*] No pre-screening results found — skipping executive summary")
@@ -754,7 +758,16 @@ class ForensicAnalyzer:
                     ai_results, messages=summary_messages
                 )
                 analysis_results['ai_analysis'] = updated
-                logger.info(f"    Executive summary generated")
+                # Persist immediately so a Phase 7 crash doesn't force us to re-pay this API call on rerun. Uses the same idempotency contract the top-of-function check reads.
+                if self._analysis_results_path:
+                    try:
+                        with open(self._analysis_results_path, 'w') as f:
+                            json.dump(analysis_results, f, indent=2, default=str)
+                        logger.info(f"    Executive summary generated (persisted to disk)")
+                    except Exception as persist_err:
+                        logger.warning(f"    Executive summary generated but failed to persist: {persist_err}")
+                else:
+                    logger.info(f"    Executive summary generated")
             else:
                 logger.info("    Executive summary skipped (user aborted)")
         except Exception as e:
